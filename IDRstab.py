@@ -80,7 +80,7 @@ def diagonal_scaling(A: CRSMatrix, b: np.ndarray) -> Tuple[CRSMatrix, np.ndarray
     return A_scaled, b_scaled, D
 
 def idrstab(A: CRSMatrix, b: np.ndarray, tol: float = 1e-8, max_iter: int = 1000,
-            s: int = 4, ell: int = 2) -> Tuple[np.ndarray, int, float, List[float]]:
+            s: int = 4, ell: int = 2) -> Tuple[np.ndarray, int, float, List[float], List[float], int]:
     """
     Solve Ax = b using IDRstab method
     
@@ -97,6 +97,8 @@ def idrstab(A: CRSMatrix, b: np.ndarray, tol: float = 1e-8, max_iter: int = 1000
         iter_count: Number of iterations performed
         residual: Final relative residual
         residual_history: List of relative residual norms during iterations
+        error_history: List of error norms during iterations
+        matvec_count: Number of matrix-vector multiplications performed
     """
     n = len(b)
     x = np.zeros(n)  # Initial guess
@@ -111,39 +113,140 @@ def idrstab(A: CRSMatrix, b: np.ndarray, tol: float = 1e-8, max_iter: int = 1000
     t = np.zeros((s, n))
     c = np.zeros(s)
     
+    # Initialize shadow residuals with random numbers
+    np.random.seed(42)  # For reproducibility
+    matvec_count = 1  # Count initial matvec
+    for k in range(s):
+        v[k] = np.random.randn(n)
+        v[k] = v[k] / np.linalg.norm(v[k])  # Normalize
+        t[k] = A.matvec(v[k])
+        matvec_count += 1
+    
     iter_count = 0
     rel_residual = 1.0  # Initial relative residual
     residual_history = [rel_residual]
+    error_history = [1.0]  # Initial error norm (normalized)
+    
+    # True solution for error calculation
+    x_true = np.ones(n)
+    x_true_norm = np.linalg.norm(x_true)
     
     while rel_residual > tol and iter_count < max_iter:
         # IDR step
         for k in range(s):
-            v[k] = r
-            t[k] = A.matvec(v[k])
-            
             # Compute coefficients
             for i in range(k):
-                c[i] = np.dot(t[k], t[i]) / np.dot(t[i], t[i])
-                v[k] -= c[i] * v[i]
-                t[k] -= c[i] * t[i]
+                c[i] = np.dot(r, t[i]) / np.dot(t[i], t[i])
+                r -= c[i] * t[i]
+            
+            # Update shadow residual
+            v[k] = r
+            t[k] = A.matvec(v[k])
+            matvec_count += 1
+            
+            # Compute step size
+            alpha = np.dot(r, t[k]) / np.dot(t[k], t[k])
             
             # Update solution and residual
-            alpha = np.dot(r, t[k]) / np.dot(t[k], t[k])
             x += alpha * v[k]
             r -= alpha * t[k]
             
             # Stabilization step (every ell iterations)
             if k == s - 1 and (iter_count + 1) % ell == 0:
                 t_stab = A.matvec(r)
+                matvec_count += 1
                 omega = np.dot(r, t_stab) / np.dot(t_stab, t_stab)
                 x += omega * r
                 r -= omega * t_stab
         
         rel_residual = np.linalg.norm(r) / r0_norm
         residual_history.append(rel_residual)
+        
+        # Calculate error norm
+        error = np.linalg.norm(x - x_true) / x_true_norm
+        error_history.append(error)
+        
         iter_count += 1
         
-    return x, iter_count, rel_residual, residual_history
+    return x, iter_count, rel_residual, residual_history, error_history, matvec_count
+
+def bicgstab(A: CRSMatrix, b: np.ndarray, tol: float = 1e-8, max_iter: int = 1000) -> Tuple[np.ndarray, int, float, List[float], List[float], int]:
+    """
+    Solve Ax = b using BiCGStab method
+    
+    Args:
+        A: CRS format matrix
+        b: Right-hand side vector
+        tol: Tolerance for convergence (relative residual)
+        max_iter: Maximum number of iterations
+        
+    Returns:
+        x: Solution vector
+        iter_count: Number of iterations performed
+        residual: Final relative residual
+        residual_history: List of relative residual norms during iterations
+        error_history: List of error norms during iterations
+        matvec_count: Number of matrix-vector multiplications performed
+    """
+    n = len(b)
+    x = np.zeros(n)  # Initial guess
+    r = b - A.matvec(x)  # Initial residual
+    r0_norm = np.linalg.norm(r)  # Initial residual norm
+    
+    # Initialize vectors
+    r0 = r.copy()  # Initial residual for BiCG
+    p = r.copy()
+    v = np.zeros(n)
+    
+    # Parameters
+    rho = 1.0
+    alpha = 1.0
+    omega = 1.0
+    
+    iter_count = 0
+    rel_residual = 1.0  # Initial relative residual
+    residual_history = [rel_residual]
+    error_history = [1.0]  # Initial error norm (normalized)
+    matvec_count = 1  # Count initial matvec
+    
+    # True solution for error calculation
+    x_true = np.ones(n)
+    x_true_norm = np.linalg.norm(x_true)
+    
+    while rel_residual > tol and iter_count < max_iter:
+        # BiCG step
+        rho_old = rho
+        rho = np.dot(r0, r)
+        beta = (rho / rho_old) * (alpha / omega)
+        p = r + beta * (p - omega * v)
+        
+        # Matrix-vector multiplication
+        v = A.matvec(p)
+        matvec_count += 1
+        
+        alpha = rho / np.dot(r0, v)
+        s = r - alpha * v
+        
+        # Matrix-vector multiplication
+        t = A.matvec(s)
+        matvec_count += 1
+        
+        omega = np.dot(t, s) / np.dot(t, t)
+        
+        # Update solution and residual
+        x += alpha * p + omega * s
+        r = s - omega * t
+        
+        rel_residual = np.linalg.norm(r) / r0_norm
+        residual_history.append(rel_residual)
+        
+        # Calculate error norm
+        error = np.linalg.norm(x - x_true) / x_true_norm
+        error_history.append(error)
+        
+        iter_count += 1
+        
+    return x, iter_count, rel_residual, residual_history, error_history, matvec_count
 
 def create_test_matrix(n: int) -> Tuple[CRSMatrix, np.ndarray, np.ndarray]:
     """
@@ -240,44 +343,118 @@ def download_suitesparse_matrix(matrix_id: str) -> Tuple[CRSMatrix, np.ndarray]:
         
         return A, b
 
-def plot_residual_history(residual_history: List[float], matrix_name: str):
+def plot_convergence_history(residual_history: List[float], error_history: List[float], matrix_name: str):
     """
-    Plot residual history
+    Plot residual and error history
     
     Args:
         residual_history: List of relative residual norms
+        error_history: List of error norms
         matrix_name: Name of the matrix for plot title
     """
-    plt.figure(figsize=(10, 6))
+    plt.figure(figsize=(12, 6))
+    
+    # Plot residual history
+    plt.subplot(1, 2, 1)
     iterations = range(len(residual_history))
     plt.semilogy(iterations, residual_history, 'b-', label='Relative residual')
     plt.grid(True)
     plt.xlabel('Iteration')
     plt.ylabel('log₁₀(Relative residual)')
-    plt.title(f'Convergence History - {matrix_name}')
+    plt.title(f'Residual History - {matrix_name}')
     plt.legend()
-    
-    # Add horizontal line at tolerance level
     plt.axhline(y=1e-8, color='r', linestyle='--', label='Tolerance (1e-8)')
-    
-    # Set y-axis limits to show meaningful range
     plt.ylim(1e-10, 1.0)
     
-    plt.savefig(f'residual_history_{matrix_name}.png', dpi=300, bbox_inches='tight')
+    # Plot error history
+    plt.subplot(1, 2, 2)
+    plt.semilogy(iterations, error_history, 'g-', label='Error norm')
+    plt.grid(True)
+    plt.xlabel('Iteration')
+    plt.ylabel('log₁₀(Relative error)')
+    plt.title(f'Error History - {matrix_name}')
+    plt.legend()
+    plt.ylim(1e-10, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(f'convergence_history_{matrix_name}.png', dpi=300, bbox_inches='tight')
+    plt.close()
+
+def compare_methods(A: CRSMatrix, b: np.ndarray, matrix_name: str):
+    """
+    Compare IDRstab and BiCGStab methods
+    
+    Args:
+        A: CRS format matrix
+        b: Right-hand side vector
+        matrix_name: Name of the matrix for plot title
+    """
+    # IDRstab parameters
+    s = 8
+    ell = 8
+    
+    # Solve with IDRstab
+    x_idrstab, iter_idrstab, res_idrstab, res_hist_idrstab, err_hist_idrstab, matvec_idrstab = idrstab(
+        A, b, s=s, ell=ell
+    )
+    
+    # Solve with BiCGStab
+    x_bicgstab, iter_bicgstab, res_bicgstab, res_hist_bicgstab, err_hist_bicgstab, matvec_bicgstab = bicgstab(
+        A, b
+    )
+    
+    # Print results
+    print(f"\nResults for matrix: {matrix_name}")
+    print(f"Matrix size: {A.shape}")
+    print("\nIDRstab:")
+    print(f"Parameters: s={s}, ell={ell}")
+    print(f"Iterations: {iter_idrstab}")
+    print(f"Matrix-vector multiplications: {matvec_idrstab}")
+    print(f"Final relative residual: {res_idrstab:.2e}")
+    print(f"Final relative error: {err_hist_idrstab[-1]:.2e}")
+    
+    print("\nBiCGStab:")
+    print(f"Iterations: {iter_bicgstab}")
+    print(f"Matrix-vector multiplications: {matvec_bicgstab}")
+    print(f"Final relative residual: {res_bicgstab:.2e}")
+    print(f"Final relative error: {err_hist_bicgstab[-1]:.2e}")
+    
+    # Plot comparison
+    plt.figure(figsize=(12, 6))
+    
+    # Plot residual history
+    plt.subplot(1, 2, 1)
+    plt.semilogy(range(len(res_hist_idrstab)), res_hist_idrstab, 'b-', label='IDRstab')
+    plt.semilogy(range(len(res_hist_bicgstab)), res_hist_bicgstab, 'r-', label='BiCGStab')
+    plt.grid(True)
+    plt.xlabel('Iteration')
+    plt.ylabel('log₁₀(Relative residual)')
+    plt.title(f'Residual History - {matrix_name}')
+    plt.legend()
+    plt.axhline(y=1e-8, color='k', linestyle='--', label='Tolerance (1e-8)')
+    plt.ylim(1e-10, 1.0)
+    
+    # Plot error history
+    plt.subplot(1, 2, 2)
+    plt.semilogy(range(len(err_hist_idrstab)), err_hist_idrstab, 'b-', label='IDRstab')
+    plt.semilogy(range(len(err_hist_bicgstab)), err_hist_bicgstab, 'r-', label='BiCGStab')
+    plt.grid(True)
+    plt.xlabel('Iteration')
+    plt.ylabel('log₁₀(Relative error)')
+    plt.title(f'Error History - {matrix_name}')
+    plt.legend()
+    plt.ylim(1e-10, 1.0)
+    
+    plt.tight_layout()
+    plt.savefig(f'comparison_{matrix_name}.png', dpi=300, bbox_inches='tight')
     plt.close()
 
 def test_suitesparse_matrices():
     """Test IDRstab with matrices from SuiteSparse"""
     # Test matrices (small to medium size)
     matrices = [
-        "HB/bcsstk01",  # 48x48 structural problem
-        "HB/bcsstk03",  # 112x112 structural problem
-        "HB/bcsstk05"   # 153x153 structural problem
+        "HB/sherman5"     # 3312x3312 petroleum reservoir simulation
     ]
-    
-    # IDRstab parameters
-    s = 4  # Shadow space dimension
-    ell = 2  # Stabilization frequency
     
     for matrix_id in matrices:
         print(f"\nTesting with matrix: {matrix_id}")
@@ -287,23 +464,9 @@ def test_suitesparse_matrices():
             # Apply diagonal scaling
             A_scaled, b_scaled, D = diagonal_scaling(A, b)
             
-            # Solve scaled system
-            x_scaled, iter_count, rel_residual, residual_history = idrstab(
-                A_scaled, b_scaled, s=s, ell=ell
-            )
-            
-            # Scale back the solution
-            x = x_scaled * D
-            
-            print(f"Matrix size: {A.shape}")
-            print(f"IDRstab parameters: s={s}, ell={ell}")
-            print(f"Number of iterations: {iter_count}")
-            print(f"Final relative residual: {rel_residual:.2e}")
-            
-            # Plot residual history
+            # Compare methods
             matrix_name = matrix_id.replace('/', '_')
-            plot_residual_history(residual_history, matrix_name)
-            print(f"Residual history plot saved as residual_history_{matrix_name}.png")
+            compare_methods(A_scaled, b_scaled, matrix_name)
             
         except Exception as e:
             print(f"Error processing matrix {matrix_id}: {str(e)}")
